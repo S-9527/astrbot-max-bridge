@@ -1,0 +1,44 @@
+# Configuration for the live QQ official bot test.
+#
+# No secret appears in this file, and none is needed: QQ credentials live in
+# AstrBot's WebUI (it owns the QQ connection) and the model credential is
+# substituted per request by the bridge's LLM proxy. What is left here is
+# addresses and a placeholder key.
+
+db:
+  url: postgresql://max:max@db:5432/max
+
+migrations_dir: /src/migrations
+images_dir: /qqtest/images
+
+# The model endpoint is the AstrBot bridge's LLM proxy, not a vendor: the
+# bridge forwards each request to whichever provider AstrBot has configured and
+# substitutes that provider's credential, so no secret is stored here at all.
+# Changing or adding a provider in AstrBot's WebUI changes Max's model on the
+# next request, with no restart on either side.
+llm:
+  default: default
+  profiles:
+    # Named "default" because that is the name Max asks for at dispatch time.
+    # Renaming it to something descriptive makes every lookup miss with
+    # "unknown llm profile: default".
+    default:
+      base_url: "http://astrbot:6199/v1"
+      # A placeholder. The bridge ignores what Max sends and swaps in the real
+      # key; Max refuses to start a profile without one.
+      api_key: "via-astrbot-bridge"
+      # Also a placeholder: the proxy replaces it with the provider's own model.
+      model: "provider-default"
+      context_window: 131072
+      temperature: 0.7
+      timeout_seconds: 1800
+      # The bridged model reads images: verified against a generated
+      # two-colour test image, which it located correctly. This is what makes
+      # Max embed data:image/... blocks instead of dropping them.
+      multimodal: true
+      # The model is a reasoning one, and a huge completion reservation costs
+      # real time before the first token: the same request measured 1.9s at
+      # 2000 and 7.1s at 111732. Interactive turns do not need 100k.
+      max_tokens: 8192
+
+

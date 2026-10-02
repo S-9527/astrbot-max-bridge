@@ -1,0 +1,12 @@
+# 密钥
+deploy/.env
+
+# Max 的源码（clone 进来，不进版本库）
+deploy/max-src/
+
+# 运行时状态：数据库、图片、AstrBot 配置（含 QQ 凭据与模型 key）
+deploy/state/
+
+# Python
+__pycache__/
+*.pyc

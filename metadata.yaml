@@ -1,0 +1,5 @@
+name: max_bridge
+desc: 把 QQ 消息转成 OneBot 11 事件交给 Max（Max 当大脑，AstrBot 只做 QQ 通道）
+version: v0.1.0
+author: anguish
+repo: https://github.com/S-9527/astrbot-max-bridge

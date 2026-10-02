@@ -1,0 +1,138 @@
+name: max-qq
+
+# QQ 助理部署栈：Max 当大脑，AstrBot 当 QQ 通道，OmniRoute（可选）当模型中转。
+#
+#   cp .env.example .env      # 填 OmniRoute 的随机密钥
+#   git clone <max> max-src   # Max 的源码，容器内 nix run path:/src#max
+#   docker compose up -d
+#
+# 三段链路：
+#
+#   QQ ──► AstrBot (qq_official)
+#          ├─► OneBot 反向 WS  ws://bot:8080/onebot  ──► Max（记忆/人格/skills）
+#          └─► LLM 代理  http://astrbot:6199/v1      ──► AstrBot 的 provider ──► 模型
+#                             http://astrbot:6198/media/<file> ◄── Max 取入站图片
+#
+# 服务名即 DNS 名，三者共用本项目的默认网络，无需手工建 network。
+# 只有 WebUI 端口对外；6198/6199 是容器内互联用的，**不对宿主机暴露**。
+# 全部服务只监听 127.0.0.1（见下方 ports），要 remotely 访问请走 SSH 隧道
+# 或 Tailscale，不要直接把端口改成 0.0.0.0。
+
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: max
+      POSTGRES_PASSWORD: max
+      POSTGRES_DB: max
+    volumes:
+      - pgdata:/var/lib/postgresql/database
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U max -d max"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  bot:
+    image: nixos/nix:latest
+    working_dir: /src
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # nix 的 substituter：国内机器优先走镜像，否则第一次 build 会很慢。
+      NIX_CONFIG: |
+        substituters = https://mirrors.ustc.edu.cn/nix-channels/store https://cache.nixos.org
+        require-sigs = false
+        download-buffer-size = 67108864
+        max-jobs = 4
+    volumes:
+      # Max 的源码。改动代码后容器内 nix 会增量重建（约 3-4 分钟）。
+      - ./max-src:/src
+      # 配置与图片目录。max.yaml 只读挂载，图片可写。
+      - ./config/max.yaml:/qqtest/max.yaml:ro
+      - ./state/images:/qqtest/images
+      # nix store：留着才能增量重建，删掉会重新下载依赖。
+      - max-nix:/nix
+    command:
+      - nix
+      - --extra-experimental-features
+      - nix-command flakes
+      - run
+      - path:/src#max
+      - --
+      - --config-file
+      - /qqtest/max.yaml
+      - --log-level
+      - info
+    restart: unless-stopped
+
+  astrbot:
+    image: soulter/astrbot:latest
+    depends_on:
+      - bot
+    ports:
+      # WebUI：唯一需要暴露的端口，且只对本机。
+      - "127.0.0.1:6185:6185"
+    environment:
+      MAX_BRIDGE_ENABLED: "1"
+      # Max 的 OneBot 反向 WS 服务端。用服务名，因为 localhost 是容器自己。
+      MAX_BRIDGE_URL: "ws://bot:8080/onebot"
+      MAX_BRIDGE_PLATFORM: "qq_official"
+      # Max 侧代表这个机器人的身份号。必须与 max.yaml 里 llm 无关，但要稳定：
+      # 它是消息去重与 @机器人判定的主键。
+      MAX_BRIDGE_SELF_ID: "10000000001"
+      MAX_BRIDGE_DB: "/AstrBot/data/max_bridge_ids.sqlite3"
+      # Max 的模型流量走这里，桥用 AstrBot 当前 provider 的凭据转发。
+      MAX_BRIDGE_LLM_PROXY: "1"
+      MAX_BRIDGE_LLM_PROXY_PORT: "6199"
+      # Max 按容器名来取入站图片。
+      MAX_BRIDGE_MEDIA_HOST: "astrbot"
+      MAX_BRIDGE_MEDIA_PORT: "6198"
+      MAX_BRIDGE_MEDIA_DIR: "/AstrBot/data/temp"
+    volumes:
+      # AstrBot 的配置与状态：QQ 凭据、provider 配置、id 映射库都在这里。
+      # 这个目录含密钥，不要提交到 git。
+      - ./state/astrbot:/AstrBot/data
+      # 桥插件。挂源码进去，改完重启容器即可生效。
+      - .:/AstrBot/data/plugins/max_bridge:ro
+    restart: unless-stopped
+
+  # ── 可选：模型中转 ──────────────────────────────────────────────────
+  # 想要「一个 key 调所有模型、绕开单家限流」才需要这一段；删掉这两个服务，
+  # 然后在 AstrBot WebUI 里直接填模型供应商即可，Max 侧不用改。
+  omniroute:
+    image: diegosouzapw/omniroute:latest
+    depends_on:
+      omniroute-redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATA_DIR: /app/data
+      REDIS_URL: redis://omniroute-redis:6379
+    volumes:
+      - omniroute-data:/app/data
+    # 面板和 OpenAI 兼容 API 都在 20128。API 端口只用 20128：
+    # 20129 那个 bridge 在本部署里不可用（详见 DEPLOY.md）。
+    ports:
+      - "127.0.0.1:20128:20128"
+    restart: unless-stopped
+
+  omniroute-redis:
+    image: docker.io/library/redis:8.6.5-alpine
+    volumes:
+      - omniroute-redis-data:/data
+    command: redis-server --save 60 1 --loglevel warning
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  max-nix:
+  omniroute-data:
+  omniroute-redis-data:
