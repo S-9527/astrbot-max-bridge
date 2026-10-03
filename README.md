@@ -21,8 +21,8 @@ QQ ──► AstrBot (qq_official)
 
 ```bash
 cd deploy && cp .env.example .env      # 填 6 个随机密钥
-git clone https://github.com/HCHogan/max max-src && git -C max-src checkout <pinned>
-docker compose up -d
+deploy/deploy.sh --dry-run            # 先看它要做什么
+deploy/deploy.sh                      # 真部署
 ```
 
 ## 装成插件（不部署整套）
@@ -68,6 +68,14 @@ onebot.py          OneBot 11 编解码，按 Max 的解析器形状写的
 media_server.py    只读媒体服务，给 Max 抓入站图片
 llm_proxy.py       OpenAI 兼容端点，转发到 AstrBot 当前 provider
 test_bridge.py     43 项单测，不需要 AstrBot 在跑
-deploy/            compose、Max 配置、密钥模板
+deploy/            compose、Max 配置、密钥模板、部署脚本、探针
 DEPLOY.md          部署文档，含 8 个实际踩过的坑
+.github/           CI、部署工作流、密钥检查
 ```
+
+## 改了代码怎么上线
+
+推到 `main` 就完事：CI 先跑单测和静态检查，再用一把只能部署的 SSH 钥匙把改动
+推到服务器，探针确认桥还活着。改 README 不会触发部署。
+
+服务器上要什么、GitHub 上要配哪几个 secret，见 [DEPLOY.md 的「自动部署」](DEPLOY.md#自动部署ci)。

@@ -1,0 +1,135 @@
+name: deploy
+
+# 推到 main 就部署。代码和部署配置变了才触发：改 README 不该让线上重启一次。
+on:
+  push:
+    branches: [main]
+    paths:
+      - "*.py"
+      - "metadata.yaml"
+      - "deploy/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "要部署的 ref（branch 或 tag）"
+        default: main
+        required: false
+      dry_run:
+        description: "只跑一遍脚本，不碰目标机（先看看它要做什么）"
+        type: boolean
+        default: false
+      pull_images:
+        description: "顺便拉新基础镜像（默认不拉，部署要只跟着 commit 走）"
+        type: boolean
+        default: false
+      force:
+        description: "丢掉目标机上的本地改动"
+        type: boolean
+        default: false
+      wait:
+        description: "等容器健康的最长秒数（第一次构建 Max 要很久）"
+        default: "900"
+        required: false
+
+permissions:
+  contents: read
+
+# 两次部署不能在服务器上交错：一个在 git reset，另一个在 restart astrbot。
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: 先确认能部署
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"   # 和 AstrBot 镜像里的一致
+      - run: python test_bridge.py
+      - run: python deploy/test_probe.py
+      - run: .github/check-secrets.sh
+      - run: bash -n deploy/deploy.sh
+
+  deploy:
+    name: 部署
+    needs: verify
+    # 没开这个变量就跳过（而不是报错）：第一次把仓库放上去时，服务器上的
+    # .env 和 QQ 凭据还没建好，不该被一次 push 逼着部署。
+    if: vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    # 在 GitHub 上给这个 environment 配 approval，就能做到「push 不直接上生产」。
+    environment: production
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 部署用的凭据齐不齐
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for v in DEPLOY_HOST DEPLOY_USER DEPLOY_SSH_KEY DEPLOY_KNOWN_HOSTS; do
+            if [ -z "${!v:-}" ]; then missing+=("$v"); fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            printf '缺仓库 secret：%s\n设置位置：Settings → Secrets → Actions\n' "${missing[*]}" >&2
+            exit 1
+          fi
+
+      - name: 部署到目标机
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}
+          REF: ${{ inputs.ref || 'main' }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          PULL_IMAGES: ${{ inputs.pull_images }}
+          FORCE: ${{ inputs.force }}
+          WAIT: ${{ inputs.wait || '900' }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # 主机密钥是钉死的，不在部署时现扫：现扫等于把「有没有人冒充这台机器」
+          # 交给 DNS。指纹要在 setup 时从可信途径核对一次。
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+          args=(--dir "${DEPLOY_DIR:-max-qq}" --ref "$REF" --wait "$WAIT")
+          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          if [ "$PULL_IMAGES" = "true" ]; then args+=(--pull); fi
+          if [ "$FORCE" = "true" ]; then args+=(--force); fi
+
+          printf '目标：%s@%s  ref=%s  参数=%s\n' "$DEPLOY_USER" "$DEPLOY_HOST" "$REF" "${args[*]}"
+
+          remote='bash -s'
+          for a in "${args[@]}"; do remote+=" $(printf '%q' "$a")"; done
+
+          ssh -i ~/.ssh/deploy_key -p "${DEPLOY_PORT:-22}" \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o BatchMode=yes \
+            "${DEPLOY_USER}@${DEPLOY_HOST}" "$remote" \
+            < deploy/deploy.sh 2>&1 | tee deploy.log
+
+      - name: 把部署日志贴进 run 摘要
+        if: always()
+        run: |
+          {
+            echo "## 部署日志"
+            echo
+            echo '```'
+            cat deploy.log 2>/dev/null || echo '(没有日志)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -66,6 +66,15 @@ services:
       - /qqtest/max.yaml
       - --log-level
       - info
+    healthcheck:
+      # Max 的 OneBot 反向 WS 服务端。这个镜像是 nix 的最小环境：没有 nc、没有
+      # netcat、没有 python3，只有 bash——所以用 bash 的 /dev/tcp。
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      # 第一次启动要 nix 构建 Max，几分钟。这段时间算 starting，不算不健康。
+      start_period: 900s
     restart: unless-stopped
 
   astrbot:
@@ -97,6 +106,12 @@ services:
       - ./state/astrbot:/AstrBot/data
       # 桥插件。挂源码进去，改完重启容器即可生效。
       - .:/AstrBot/data/plugins/max_bridge:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1:6185/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
     restart: unless-stopped
 
   # ── 可选：模型中转 ──────────────────────────────────────────────────

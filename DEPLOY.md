@@ -18,16 +18,20 @@ cd astrbot-max-bridge/deploy
 
 cp .env.example .env            # 填 6 个随机密钥，每个都是 openssl rand -hex 32
 
-# Max 钉在上游某个 commit，不要用 main
-git clone https://github.com/HCHogan/max max-src
-git -C max-src checkout a433f56612cfe7189574e5fa95c25f95534bdcb2
+# Max 的版本钉在 deploy/max.pin 第一行，不要用 main
+deploy/deploy.sh                # 拉仓库、检出钉住的 Max、起 compose、探活
 
-docker compose up -d
 open http://127.0.0.1:6185      # QQ 凭据、模型 provider 都在这里配
 ```
 
-第一次 `up` 会构建 Max，约 4-10 分钟（取决于网速）。`max-nix` 卷留着，之后改
-Max 代码是增量重建，约 3 分钟。
+第一次部署会构建 Max，约 4-10 分钟（取决于网速）。`max-nix` 卷留着，之后改 Max
+代码是增量重建，约 3 分钟。
+
+先看它打算做什么而不真做：
+
+```bash
+deploy/deploy.sh --dry-run
+```
 
 ## 前置条件
 
@@ -40,7 +44,9 @@ Max 代码是增量重建，约 3 分钟。
 
 **为什么钉 commit**：桥按 OneBot 11 的事件形状构造消息。上游若改了必填字段，
 桥要跟着改；钉住版本能让「升级后图片/引用全失效」这类问题变成一次明确的
-diff，而不是玄学。
+diff，而不是玄学。钉在 `deploy/max.pin`，部署脚本读它，CI 还会验证这个 sha 在
+上游 `main` 上真的存在——钉一个被删掉的 sha，失败点会出现在 nix 构建中间，很难
+看出是版本问题。
 
 **端口**：只有 `6185`（AstrBot WebUI）和 `20128`（OmniRoute 面板）映射到宿主，
 且都绑 `127.0.0.1`。远程访问走隧道：
@@ -132,6 +138,106 @@ QQ 的引用只带消息 id，跨会话时那个 id 是空的。AstrBot 适配�
 带思考的模型尤其明显：同一请求 `max_tokens=2000` 是 1.9s，`111732` 是 7.1s。
 `deploy/config/max.yaml` 里设 8192。
 
+## 自动部署（CI）
+
+推到 `main` 就部署。改 README 不会触发——只有 `*.py`、`metadata.yaml`、
+`deploy/**` 和部署工作流本身变了才部署，因为桥的代码变了就必须重启 astrbot，
+那是几秒钟的 QQ 断线，不该为一句文档改动付这个代价。
+
+### 两个工作流
+
+| 工作流 | 什么时候跑 | 做什么 |
+| --- | --- | --- |
+| `ci` | 每次 push / PR | 桥的 43 项单测（py 3.11/3.12/3.13）、探针自测、compose 能不能解析、脚本语法与 shellcheck、钉的 Max 版本在上游还在不在、**仓库里有没有密钥** |
+| `deploy` | 推 main（限上面那些路径）或手动 | 先跑一遍 ci 的关键项，再 ssh 到服务器执行 `deploy/deploy.sh` |
+
+### 服务器上一次性要做的
+
+```bash
+# 1. 给 CI 一把只能部署、不能乱来的钥匙
+sudo useradd -m -s /bin/bash deployer || true
+sudo -u deployer ssh-keygen -t ed25519 -N '' -C 'github-actions deploy'
+cat ~deployer/.ssh/id_ed25519.pub        # 贴到 GitHub 的 DEPLOY_SSH_KEY
+
+# 2. deployer 要能操作 docker
+sudo usermod -aG docker deployer
+
+# 3. 目标机的仓库和密钥
+sudo -u deployer git clone https://github.com/S-9527/astrbot-max-bridge ~/max-qq
+cd ~/max-qq/deploy && cp .env.example .env
+# 填 6 个随机密钥：openssl rand -hex 32，一个一行
+```
+
+### GitHub 上要配的
+
+**Secrets**（Settings → Secrets → Actions）：
+
+| 名字 | 内容 |
+| --- | --- |
+| `DEPLOY_HOST` | 服务器地址 |
+| `DEPLOY_USER` | `deployer` |
+| `DEPLOY_PORT` | 可选，默认 22 |
+| `DEPLOY_SSH_KEY` | 上一步那个私钥（**私钥**，不是 .pub） |
+| `DEPLOY_KNOWN_HOSTS` | 见下 |
+
+`DEPLOY_KNOWN_HOSTS` 用 `ssh-keyscan -p 22 <host>` 生成，但要**从可信途径核对
+指纹**（云厂商控制台、或第一次手动登录时记下的）。写进仓库的必须是这份核对过的
+结果：部署时现扫 `ssh-keyscan` 等于把「有没有人冒充这台机器」交给 DNS。
+
+**Variables**：
+
+| 名字 | 值 | 作用 |
+| --- | --- | --- |
+| `DEPLOY_ENABLED` | `true` | 不设就**跳过**部署而不是报错。第一次把仓库放上去时，服务器上的 `.env` 和 QQ 凭据还没建好，不该被一次 push 逼着部署 |
+| `DEPLOY_DIR` | `max-qq` | 相对 `deployer` 的家目录 |
+
+### 手动触发
+
+Actions → deploy → Run workflow：
+
+| 输入 | 作用 |
+| --- | --- |
+| `ref` | 部署别的分支或 tag，不动就填 `main` |
+| `dry_run` | **先看它要做什么而不真做**，第一次部署强烈建议先勾这个 |
+| `pull_images` | 顺带拉新基础镜像。默认不拉：部署要只跟着 commit 走，不跟着 `latest` 走 |
+| `force` | 丢掉目标机上的本地改动（默认拒绝，见下） |
+| `wait` | 等容器健康的最长秒数，默认 900 |
+
+### 部署脚本做什么
+
+`deploy/deploy.sh` 在目标机上跑，顺序是：前置检查 → `git fetch` + `reset --hard`
+到目标 ref → 把 `max-src` 对齐到 `deploy/max.pin` → `docker compose up -d --wait`
+→ 桥的代码变了才 `restart astrbot` → 探针 → 打印结果。日志会贴进 run 摘要。
+
+它刻意不做几件事：
+
+- **不生成 `.env`**。密钥一旦被换掉，OmniRoute 磁盘上加密的旧数据就解不开了，
+  这种事不能让它顺手做掉。缺 `.env` 就停下来报错。
+- **不碰 `state/` 和 `.env`**。两者都在 `.gitignore` 里，`reset --hard` 只动已
+  跟踪的文件，所以 QQ 凭据和 id 映射库每次部署都原样保留。
+- **CI 从头到尾看不到任何密钥**。GitHub 上只需要一把 SSH 私钥，模型 key 始终
+  只存在于服务器上。
+- **不删未跟踪的文件**。只有在目标机上改了**已跟踪**文件时才停下来问（加
+  `--force` 才继续）——否则某次部署会静默丢掉你手改的 compose。
+
+### 探针
+
+部署完会跑 `deploy/probe.py`，问桥在容器内的两个端口还活着吗。这两个端口只有
+在插件导入成功、后台任务起来之后才存在：插件挂了的时候 AstrBot 照常启动、日志
+里只有一条 traceback、QQ 那边完全静默，从外面看「服务是好的」。探针发的请求走一
+条没有路由匹配的路径，由 aiohttp 就地 404，不外发、不花额度。
+
+它只证明插件活着，不证明 QQ 消息进得来。要确认整条链路，给机器人发一条消息，
+然后查 `message_deliveries`（见下面「运维」）。
+
+### 回滚
+
+```bash
+cd ~/max-qq
+git reset --hard <旧的 commit>       # 记得回到 main 上，否则下次 CI 拉不动
+(cd deploy && docker compose up -d --wait)
+```
+
 ## 运维
 
 ```bash
@@ -190,12 +296,20 @@ docker compose down -v   # 连数据一起删（丢记忆和凭据）
 
 ## 开发
 
+本地跑的东西和 CI 完全一样：
+
 ```bash
-python3 test_bridge.py      # 43 项，不需要 AstrBot 在跑
+python3 test_bridge.py              # 43 项桥单测，不需要 AstrBot 在跑
+python3 deploy/test_probe.py        # 12 项探针自测：每个分支都用真的端口试一遍
+.github/check-secrets.sh            # 仓库里有没有密钥
+bash -n deploy/deploy.sh && shellcheck deploy/deploy.sh
+actionlint                          # 工作流语法
+deploy/deploy.sh --dry-run          # 部署脚本会做什么（只读）
 ```
 
-覆盖 id 映射的跨重启稳定性、整数约束、私聊事件不带 `group_id`、同秒内消息顺序、
-引用往返，以及每种 OneBot action 的应答形状。
+桥单测覆盖 id 映射的跨重启稳定性、整数约束、私聊事件不带 `group_id`、同秒内
+消息顺序、引用往返，以及每种 OneBot action 的应答形状。探针自测覆盖：404 算活着、
+只连上不回话不算活着、非 404 要提醒、目录缺失要报错。
 
 改桥的代码就在本仓库根目录（`main.py` 等），`deploy/compose.yaml` 把仓库根挂进
 `/AstrBot/data/plugins/max_bridge`，所以重启容器即生效：
@@ -203,3 +317,5 @@ python3 test_bridge.py      # 43 项，不需要 AstrBot 在跑
 ```bash
 cd deploy && docker compose restart astrbot
 ```
+
+推到 `main` 之后，CI 会自动部署到服务器（见上面「自动部署」）。

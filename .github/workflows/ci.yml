@@ -1,0 +1,99 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bridge:
+    name: 桥单测 (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 是 AstrBot 镜像里那个版本，必须绿；3.11/3.13 是为了别写出只在某个
+        # 版本上能跑的语法。
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "${{ matrix.python }}"
+      - run: python test_bridge.py
+
+  probe:
+    name: 部署探针自测
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python deploy/test_probe.py
+
+  deploy-files:
+    name: 部署文件能用
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 造一份假的 .env，只为让 compose 能解析
+        # 真密钥永远不进仓库，所以这一步只能拿占位符凑齐变量。
+        run: |
+          set -euo pipefail
+          sed -E 's/^([A-Z_]+)=.*/\1=ci-placeholder-not-a-secret/' deploy/.env.example > deploy/.env
+
+      - name: compose 能解析
+        run: docker compose -f deploy/compose.yaml --env-file deploy/.env config --quiet
+
+      - name: 脚本语法
+        run: |
+          bash -n deploy/deploy.sh
+          shellcheck deploy/deploy.sh
+
+      - name: 部署脚本的 dry-run 走一遍
+        run: deploy/deploy.sh --dry-run --dir "$RUNNER_TEMP/还不存在的目录"
+
+      - name: 钉的 Max 版本在上游真的存在，而且还在 main 上
+        # 钉一个上游已经删掉或重写掉的 sha，服务器上会构建失败，而失败点出现在
+        # nix 构建中间，很难看出是版本钉错了。所以在这里就拦住。
+        run: |
+          set -euo pipefail
+          PIN=$(awk '!/^[[:space:]]*#/ && NF { gsub(/[[:space:]]/, ""); print; exit }' deploy/max.pin)
+          git init -q pin-check
+          git -C pin-check remote add origin https://github.com/HCHogan/max.git
+          git -C pin-check fetch -q --depth 1 origin "$PIN"
+          git -C pin-check cat-file -e "$PIN^{commit}"
+          git -C pin-check fetch -q --depth 200 origin main
+          if ! git -C pin-check merge-base --is-ancestor "$PIN" FETCH_HEAD; then
+            echo "钉的 $PIN 不在上游 main 最近 200 个提交里了，重新钉一个" >&2
+            exit 1
+          fi
+          echo "Max 钉在 $PIN，在上游 main 上"
+
+  lint:
+    name: 工作流 lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 装 actionlint
+        # 不用第三方 action：直接拉固定版本的二进制，来源和版本都在这里看得见。
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/al.tgz \
+            "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz"
+          tar -C /usr/local/bin -xzf /tmp/al.tgz actionlint
+          actionlint --version
+      - run: actionlint -color
+      - run: shellcheck .github/check-secrets.sh
+
+  secrets:
+    name: 仓库里没有密钥
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: .github/check-secrets.sh
